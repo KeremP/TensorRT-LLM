@@ -14,10 +14,8 @@
 # limitations under the License.
 from typing import Optional, Union
 
-from ..._common import default_net
 from ..._utils import pad_vocab_size
-from ...functional import (AllReduceFusionOp, AllReduceFusionParams, Tensor,
-                           non_gated_version, recv, send)
+from ...functional import Tensor, non_gated_version, recv, send
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, PositionEmbeddingType, RmsNorm)
 from ...lora_manager import LoraConfig, use_lora
@@ -47,9 +45,9 @@ class LLaMADecoderLayer(Module):
                                        dtype=config.dtype)
 
         layers_range = config.mapping.pp_layers(config.num_hidden_layers)
-        self.local_layer_idx = layer_idx - layers_range[0]
+        local_layer_idx = layer_idx - layers_range[0]
         self.attention = Attention(
-            local_layer_idx=self.local_layer_idx,
+            local_layer_idx=local_layer_idx,
             hidden_size=config.hidden_size,
             attention_head_size=config.head_size,
             num_attention_heads=config.num_attention_heads,
@@ -66,26 +64,33 @@ class LLaMADecoderLayer(Module):
             tp_rank=config.mapping.tp_rank,
             quant_mode=config.quant_mode)
 
-        mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
-
         ClsMLP = GatedMLP
         mlp_kwargs = {}
-        if config.moe.has_moe():
-            ClsMLP = MOE
-            mlp_kwargs = {
-                "moe_config": config.moe,
-                "mapping": config.mapping,
-            }
+
+        if config.dense_replace.has_replace() and layer_idx < config.dense_replace.first_k_moe_replace_by_dense:
+            # replace first layers by dense
+            assert config.moe.has_moe(), "DenseReplaceConfig can be used with moe only"
+            mlp_hidden_size = config.dense_replace.dense_intermediate_size
+            hidden_act = non_gated_version(config.hidden_act) # back to non gated for dense layers
+        else:
+            mlp_hidden_size = config.hidden_size * 4 if config.intermediate_size is None else config.intermediate_size
+            hidden_act = config.hidden_act
+            if config.moe.has_moe():
+                ClsMLP = MOE
+                mlp_kwargs = {
+                    "moe_config": config.moe,
+                    "tp_rank": config.mapping.tp_rank,
+                }
+
         self.mlp = ClsMLP(hidden_size=config.hidden_size,
                           ffn_hidden_size=mlp_hidden_size,
-                          hidden_act=config.hidden_act,
+                          hidden_act=hidden_act,
                           dtype=config.dtype,
                           bias=config.mlp_bias,
                           tp_group=config.mapping.tp_group,
                           tp_size=config.mapping.tp_size,
                           quant_mode=config.quant_mode,
                           **mlp_kwargs)
-
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
                                       eps=config.norm_epsilon,
                                       dtype=config.dtype)
@@ -95,6 +100,7 @@ class LLaMADecoderLayer(Module):
         self.has_residual_mlp = False
         if hasattr(self.config,
                    "residual_mlp") and self.config.residual_mlp is True:
+            assert not config.dense_replace.has_replace(), "Residual mlp unsupports DenseReplaceConfig"
             self.has_residual_mlp = True
 
         if self.has_residual_mlp:
@@ -122,17 +128,9 @@ class LLaMADecoderLayer(Module):
                 spec_decoding_params=None,
                 kv_cache_params=None,
                 attention_params=None,
-                lora_layer_params=None,
-                next_layer_input_layernorm_args=None):
-        assert not (
-            default_net().plugin_config.reduce_fusion and self.has_residual_mlp
-        ), "Custom all reduce and residual mlp can't be enabled at the same time."
-        if default_net(
-        ).plugin_config.reduce_fusion and self.local_layer_idx > 0:
-            hidden_states, residual = hidden_states
-        else:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+                lora_layer_params=None):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
         attention_output = self.attention(
             hidden_states,
@@ -141,21 +139,16 @@ class LLaMADecoderLayer(Module):
             spec_decoding_params=spec_decoding_params,
             kv_cache_params=kv_cache_params,
             attention_params=attention_params,
-            lora_layer_params=lora_layer_params,
-            reduce_fusion_params=AllReduceFusionParams(
-                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM
-                if default_net().plugin_config.reduce_fusion else
-                AllReduceFusionOp.NONE,
-                residual=residual,
-                norm_weight=self.post_layernorm.weight.value,
-                eps=self.post_layernorm.eps))
+            lora_layer_params=lora_layer_params)
 
         if use_cache:
             attention_output, presents = attention_output
 
+        hidden_states = residual + attention_output
+
+        residual_attn = hidden_states
+
         if self.has_residual_mlp:
-            hidden_states = residual + attention_output
-            residual_attn = hidden_states
             # arctic layer w/ residual mlp
 
             # residual mlp
@@ -170,27 +163,12 @@ class LLaMADecoderLayer(Module):
                                      lora_layer_params=lora_layer_params)
             hidden_states = residual_mlp + hidden_states
         else:
-            if default_net().plugin_config.reduce_fusion:
-                hidden_states, residual = attention_output
-            else:
-                hidden_states = residual + attention_output
-                residual = hidden_states
-                hidden_states = self.post_layernorm(hidden_states)
-            if next_layer_input_layernorm_args is not None:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    lora_layer_params=lora_layer_params,
-                    reduce_fusion_params=AllReduceFusionParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM
-                        if default_net().plugin_config.reduce_fusion else
-                        AllReduceFusionOp.NONE,
-                        residual=residual,
-                        norm_weight=next_layer_input_layernorm_args[0],
-                        eps=next_layer_input_layernorm_args[1]))
-            else:
-                hidden_states = self.mlp(hidden_states,
-                                         lora_layer_params=lora_layer_params)
-                hidden_states = residual + hidden_states
+            # regular llama/mixtral layers
+            hidden_states = self.post_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states,
+                                     lora_layer_params=lora_layer_params)
+            hidden_states = residual_attn + hidden_states
+
         if use_cache:
             return (hidden_states, presents)
         return hidden_states
@@ -318,7 +296,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         elif load_by_shard:
             weights = load_weights_from_hf_by_shard(hf_model_dir, config)
         elif has_safetensors(
-                hf_model_dir) and not config.quant_mode.has_any_quant():
+                hf_model_dir) and not config.quant_mode.has_any_quant() and not config.dense_replace.has_replace():
             weights = load_weights_from_hf_safetensors(hf_model_dir, config)
         else:
             hf_model = load_hf_llama(hf_model_dir, load_model_on_cpu)

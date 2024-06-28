@@ -57,6 +57,7 @@ class MoeConfig:
     num_experts: int = 0
     top_k: int = 0
     normalization_mode: ExpertScaleNormalizationMode = ExpertScaleNormalizationMode.RENORMALIZE
+    num_shared_experts: int = 0
 
     def validate(self) -> "MoeConfig":
         if (self.num_experts == 0) != (self.top_k == 0):
@@ -339,6 +340,21 @@ class MixtureOfExperts(Module):
 
         self.init_experts()
 
+        ClsMLP = GatedMLP if is_gated_activation(self.hidden_act) else MLP
+
+        self.shared_experts = ClsMLP(
+            self.hidden_size, 
+            ffn_hidden_size * self.moe_config.num_shared_experts,
+            non_gated_version(self.hidden_act),
+            bias,
+            dtype,
+            tp_group,
+            tp_size,
+            quant_mode
+        ) if self.moe_config.num_shared_experts > 0 else None
+        
+
+
     def init_experts(self):
         # Note we use horizontal fusion for gated activation to do the operation in one GEMM invocation
         #  The left matrix is a linear projection (no activation applied)
@@ -361,8 +377,10 @@ class MixtureOfExperts(Module):
                 0, "moe_router")
         routing_input = cast(hidden_states, trt.float32)
         routing = self.router(routing_input, moe_router_lora_params)
-        return self.forward_experts(hidden_states, routing, finished,
-                                    lora_layer_params)
+        output = self.forward_experts(hidden_states, routing, finished, lora_layer_params)
+        if self.shared_experts is not None:
+            output += self.shared_experts(hidden_states)
+        return output
 
     def forward_experts(self, hidden_states, routing, finished,
                         lora_layer_params):

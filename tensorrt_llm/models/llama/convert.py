@@ -665,6 +665,7 @@ def load_weights_from_hf_model(hf_model,
                                act_range: Optional[dict] = None,
                                qkv_para: Optional[dict] = None,
                                smoother: Optional[dict] = None):
+    model_type = hf_model.config.model_type
     quant_algo = config.quantization.quant_algo
     use_weight_only = quant_algo in [QuantAlgo.W8A16, QuantAlgo.W4A16]
     if quant_algo == QuantAlgo.W8A16:
@@ -691,6 +692,8 @@ def load_weights_from_hf_model(hf_model,
 
     mapping = config.mapping
     moe_config = config.moe
+    dense_replace_config = config.dense_replace
+
     mha_mode = (config.num_key_value_heads == config.num_attention_heads)
     layers_range = config.mapping.pp_layers(config.num_hidden_layers)
 
@@ -838,24 +841,31 @@ def load_weights_from_hf_model(hf_model,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
 
-        if moe_config.has_moe():
+        if moe_config.has_moe() and not (dense_replace_config.has_replace() and l < dense_replace_config.first_k_moe_replace_by_dense):
             rank_experts = list(range(moe_config.num_experts))
-            if mapping.has_moe_ep():
+            if moe_config.tp_mode == moe_config.ParallelismMode.EXPERT_PARALLEL:
                 rank_experts = mapping.ep_experts(moe_config.num_experts)
-            for suffix in ["w1", "w2", "w3"]:
-                model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
-                            torch.stack([model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight'].detach()
-                                        for expert in rank_experts])
+            if model_type == "deepseek":
+                # deepseek names different for expert weigths
+                for suffix, deepseek_suffix in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+                    model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
+                                torch.stack([model_params[f'model.layers.{l}.mlp.experts.{expert}.{deepseek_suffix}.weight'].detach()
+                                            for expert in rank_experts])
+            else:
+                for suffix in ["w1", "w2", "w3"]:
+                    model_params[f'model.layers.{l}.block_sparse_moe.experts.{suffix}.weight'] = \
+                                torch.stack([model_params[f'model.layers.{l}.block_sparse_moe.experts.{expert}.{suffix}.weight'].detach()
+                                            for expert in rank_experts])
             w3 = model_params[
                 f'model.layers.{l}.block_sparse_moe.experts.w3.weight']
             w2 = model_params[
                 f'model.layers.{l}.block_sparse_moe.experts.w2.weight']
             w1 = model_params[
                 f'model.layers.{l}.block_sparse_moe.experts.w1.weight']
-            if mapping.has_moe_tp():
-                w3 = split(w3, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1)
-                w2 = split(w2, mapping.moe_tp_size, mapping.moe_tp_rank, dim=2)
-                w1 = split(w1, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1)
+            if moe_config.tp_mode == moe_config.ParallelismMode.TENSOR_PARALLEL:
+                w3 = split(w3, mapping.tp_size, mapping.tp_rank, dim=1)
+                w2 = split(w2, mapping.tp_size, mapping.tp_rank, dim=2)
+                w1 = split(w1, mapping.tp_size, mapping.tp_rank, dim=1)
 
             model_params[
                 f'model.layers.{l}.block_sparse_moe.experts.w3w1.weight'] = torch.concat(
@@ -991,8 +1001,13 @@ def load_weights_from_hf_model(hf_model,
                                                plugin_weight_only_quant_type,
                                                dtype, use_gemm_woq_plugin))
 
-            moe_experts_gate_weights = get_weight(
-                model_params, prefix + 'block_sparse_moe.gate', torch.float32)
+            if model_type == "deepseek":
+                # deepseek names different for router
+                moe_experts_gate_weights = get_weight(
+                    model_params, prefix + 'mlp.gate', torch.float32)
+            else:
+                moe_experts_gate_weights = get_weight(
+                    model_params, prefix + 'block_sparse_moe.gate', torch.float32)
             weights.update(
                 get_tllm_linear_weight(
                     moe_experts_gate_weights,
@@ -1002,6 +1017,56 @@ def load_weights_from_hf_model(hf_model,
                     plugin_weight_only_quant_type,
                     dtype,
                     use_gemm_woq_plugin))
+
+            if model_type == "deepseek" and moe_config.num_shared_experts > 0:
+                # deepseek shared experts
+
+                mlp_gate_weight = get_weight(model_params, prefix + 'mlp.shared_experts.up_proj',
+                                            dtype)
+                split_v = split_matrix_tp(mlp_gate_weight,
+                                        mapping.tp_size,
+                                        mapping.tp_rank,
+                                        dim=0)
+                if use_smooth_quant:
+                    assert False, "Unsupports use_smooth_quant for deepseek"
+                else:
+                    weights.update(
+                        get_tllm_linear_weight(split_v, tllm_prex + 'mlp.shared_experts.gate.',
+                                            None, use_weight_only,
+                                            plugin_weight_only_quant_type, dtype,
+                                            use_gemm_woq_plugin))
+
+                mlp_fc_weight = get_weight(model_params, prefix + 'mlp.shared_experts.gate_proj',
+                                        dtype)
+                split_v = split_matrix_tp(mlp_fc_weight,
+                                        mapping.tp_size,
+                                        mapping.tp_rank,
+                                        dim=0)
+
+                if use_smooth_quant:
+                    assert False, "Unsupports use_smooth_quant for deepseek"
+                else:
+                    weights.update(
+                        get_tllm_linear_weight(split_v, tllm_prex + 'mlp.shared_experts.fc.', None,
+                                            use_weight_only,
+                                            plugin_weight_only_quant_type, dtype,
+                                            use_gemm_woq_plugin))
+
+                mlp_proj_weight = get_weight(model_params, prefix + 'mlp.shared_experts.down_proj',
+                                            dtype)
+                split_v = split_matrix_tp(mlp_proj_weight,
+                                        mapping.tp_size,
+                                        mapping.tp_rank,
+                                        dim=1)
+
+                if use_smooth_quant:
+                    assert False, "Unsupports use_smooth_quant for deepseek"
+                else:
+                    weights.update(
+                        get_tllm_linear_weight(split_v, tllm_prex + 'mlp.shared_experts.proj.',
+                                            None, use_weight_only,
+                                            plugin_weight_only_quant_type, dtype,
+                                            use_gemm_woq_plugin))
         else:
             mlp_gate_weight = get_weight(model_params, prefix + 'mlp.up_proj',
                                          dtype)
@@ -1503,21 +1568,16 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
 
     model_dir = model_dir if model_dir.endswith("/") else model_dir + "/"
     safetensors_map = {}
-    has_safetensor_index_json = True
     try:
         with open(model_dir + "model.safetensors.index.json", 'r') as fr:
             sharding_map = json.load(fr)
         for k, v in sharding_map['weight_map'].items():
             safetensors_map[k] = int(v[6:11]) - 1
     except FileNotFoundError:
-        has_safetensor_index_json = False
-
+        pass
     shard_files = []
     for name in os.listdir(model_dir):
         if name.endswith(".safetensors"):
-            if has_safetensor_index_json and name not in sharding_map[
-                    'weight_map'].values():
-                continue
             shard_files.append(name)
     shard_files.sort()
     safetensors_ptrs = [
@@ -1534,12 +1594,6 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
     dtype = config.dtype
 
     moe_config = config.moe
-
-    kv_tp_size = None
-    kv_tp_rank = None
-    if config.num_key_value_heads < mapping.tp_size:
-        kv_tp_size = config.num_key_value_heads
-        kv_tp_rank = mapping.tp_rank * kv_tp_size // mapping.tp_size
 
     model_prefix = "model."
     key_list = [
@@ -1558,56 +1612,31 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
 
     torch_dtype = str_dtype_to_torch(dtype)
 
-    def load(key,
-             tp_dim=-1,
-             no_prefix=0,
-             is_expert_weights=False,
-             tp_size=None,
-             tp_rank=None):
+    def load(key, tp_dim=-1, no_prefix=0):
         if not no_prefix:
             key = model_prefix + key
         ptr_idx = safetensors_map[key] if key in safetensors_map else 0
-
-        if key not in safetensors_ptrs[ptr_idx].keys():
-            return None
-
-        tensor_slice = safetensors_ptrs[ptr_idx].get_slice(key)
-        tensor_shape = tensor_slice.get_shape()
         if tp_dim == -1:
-            res = tensor_slice[:]
-        elif tp_dim >= 0 and tp_dim < len(tensor_shape):
-            if is_expert_weights:
-                tp_size = mapping.moe_tp_size
-                tp_rank = mapping.moe_tp_rank
-            else:
-                tp_size = tp_size or mapping.tp_size
-                tp_rank = tp_rank or mapping.tp_rank
-            dim_size = tensor_shape[tp_dim]
-            if dim_size % tp_size != 0:
-                logger.error(
-                    f"Current weight shape {tensor_shape} is invalid at dimension {tp_dim} for TP size {tp_size}"
-                )
-            indices = [slice(None)] * len(tensor_shape)
-            indices[tp_dim] = slice(dim_size * tp_rank // tp_size,
-                                    dim_size * (tp_rank + 1) // tp_size)
-            res = tensor_slice[indices]
+            res = safetensors_ptrs[ptr_idx].get_tensor(key)
         else:
-            raise ValueError(f"Invalid TP dim: {tp_dim}")
+            tensor_slice = safetensors_ptrs[ptr_idx].get_slice(key)
+            tensor_shape = tensor_slice.get_shape()
+            if tensor_shape[tp_dim] % mapping.tp_size != 0:
+                logger.error(
+                    "Current weight shape is invalid for mapping.tp_size=" +
+                    str(mapping.tp_size))
+            slice_width = tensor_shape[tp_dim] // mapping.tp_size
+            if tp_dim == 0:
+                res = tensor_slice[slice_width * mapping.tp_rank:slice_width *
+                                   (mapping.tp_rank + 1), :]
+            elif tp_dim == 1:
+                res = tensor_slice[:,
+                                   slice_width * mapping.tp_rank:slice_width *
+                                   (mapping.tp_rank + 1)]
+            else:
+                assert False, "Invalid TP dim"
         return res.to(torch_dtype).contiguous(
         ) if "block_sparse_moe.gate" not in key else res.to(torch.float32)
-
-    def load_and_set(target,
-                     key,
-                     tp_dim=-1,
-                     no_prefix=0,
-                     is_expert_weights=False):
-        res = load(key, tp_dim, no_prefix, is_expert_weights)
-        weights[target] = res
-        if "weight" in key:
-            bias = load(key.replace("weight", "bias"), tp_dim, no_prefix,
-                        is_expert_weights)
-            if bias is not None:
-                weights[target.replace("weight", "bias")] = bias
 
     if mapping.is_first_pp_rank():
         weights['transformer.vocab_embedding.weight'] = load(
@@ -1633,53 +1662,32 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         # Attention
         qkv_list = []
         for comp in ["q", "k", "v"]:
-            tp_size = kv_tp_size if comp != "q" else None
-            tp_rank = kv_tp_rank if comp != "q" else None
-            weight_part = load(prefix + key_list[3] + comp + key_list[4],
-                               0,
-                               tp_size=tp_size,
-                               tp_rank=tp_rank)
-            qkv_list.append(weight_part)
-            bias_part = load(
-                (prefix + key_list[3] + comp + key_list[4]).replace(
-                    "weight", "bias"),
-                0,
-                tp_size=tp_size,
-                tp_rank=tp_rank)
-            if bias_part is not None:
-                qkv_list.append(bias_part)
-        if len(qkv_list) == 3:
-            # No bias
-            weights[f'{tllm_prex}.attention.qkv.weight'] = torch.cat(
-                qkv_list, 0)
-        else:
-            weights[f'{tllm_prex}.attention.qkv.weight'] = torch.cat(
-                qkv_list[::2], 0)
-            weights[f'{tllm_prex}.attention.qkv.bias'] = torch.cat(
-                qkv_list[1::2], 0)
-        load_and_set(f'{tllm_prex}.attention.dense.weight',
-                     prefix + key_list[5], 1)  # attention.dense
+            comp_part = load(prefix + key_list[3] + comp + key_list[4], 0)
+            qkv_list.append(comp_part)
+        weights[f'{tllm_prex}.attention.qkv.weight'] = torch.cat(qkv_list, 0)
+        weights[f'{tllm_prex}.attention.dense.weight'] = load(
+            prefix + key_list[5], 1)  # attention.dense
 
         # MLP
         if not moe_config.has_moe():
-            load_and_set(f'{tllm_prex}.mlp.gate.weight', prefix + key_list[6],
-                         0)  # mlp.gate
-            load_and_set(f'{tllm_prex}.mlp.proj.weight', prefix + key_list[7],
-                         1)  # mlp.proj
-            load_and_set(f'{tllm_prex}.mlp.fc.weight', prefix + key_list[8],
-                         0)  # mlp.fc
+            weights[f'{tllm_prex}.mlp.gate.weight'] = load(
+                prefix + key_list[6], 0)  # mlp.gate
+            weights[f'{tllm_prex}.mlp.proj.weight'] = load(
+                prefix + key_list[7], 1)  # mlp.proj
+            weights[f'{tllm_prex}.mlp.fc.weight'] = load(
+                prefix + key_list[8], 0)  # mlp.fc
 
         else:
             weights[f'{tllm_prex}.mlp.router.weight'] = load(
                 prefix + 'block_sparse_moe.gate.weight')
             rank_experts = list(range(moe_config.num_experts))
-            if mapping.has_moe_ep():
+            if moe_config.tp_mode == moe_config.ParallelismMode.EXPERT_PARALLEL:
                 rank_experts = mapping.ep_experts(moe_config.num_experts)
 
             expert_weight_list = []
             for suffix in range(3):
                 tp_dim = -1
-                if mapping.has_moe_tp():
+                if moe_config.tp_mode == moe_config.ParallelismMode.TENSOR_PARALLEL:
                     tp_dim = 1 if suffix == 1 else 0
                 expert_weight_list.append(
                     torch.stack(
@@ -1687,9 +1695,7 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                             load(
                                 prefix +
                                 f'block_sparse_moe.experts.{expert}.w{suffix + 1}.weight',
-                                tp_dim=tp_dim,
-                                is_expert_weights=True)
-                            for expert in rank_experts)))
+                                tp_dim=tp_dim) for expert in rank_experts)))
 
             w1 = expert_weight_list[0]
             w2 = expert_weight_list[1]
@@ -1699,10 +1705,10 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
                 torch.concat([w3, w1], dim=-2).contiguous()
             weights[f'{tllm_prex}.mlp.proj.weight'] = w2.contiguous()
 
-        load_and_set(f'{tllm_prex}.input_layernorm.weight',
-                     prefix + key_list[9])  # input_layernorm
-        load_and_set(f'{tllm_prex}.post_layernorm.weight',
-                     prefix + key_list[10])  # post_layernorm
+        weights[f'{tllm_prex}.input_layernorm.weight'] = load(
+            prefix + key_list[9])  # input_layernorm
+        weights[f'{tllm_prex}.post_layernorm.weight'] = load(
+            prefix + key_list[10])  # post_layernorm
 
     tok = time.time()
     t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
